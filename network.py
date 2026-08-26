@@ -9,19 +9,22 @@ from speechbrain.processing.features import STFT, Filterbank
 from models.resnet18_encoder import resnet18
 from utils.utils import count_acc,Averager
 import tqdm,os
-from models.feature_enhancer import EnhancedLocalFeature
 from models.AttnClassifier import Classifier
 from sklearn.cluster import KMeans
 from scipy.optimize import linear_sum_assignment
 import numpy as np
-from models.resnet_enhancer import LocalFeatureCluster
 class MYNET(nn.Module):
 
     def __init__(self,args, mode=None):
         super().__init__()
         self.mode = mode# 模式设置，例如'encoder'或'openmeta' 
         self.args = args# 存储超参数的对象 
-        self.encoder = resnet18(True, args)  # pretrained=False # 使用预训练的ResNet18作为特征提取器 
+        # Never let experiment construction download weights implicitly. Publishable
+        # runs restore the complete encoder from an explicitly checked local checkpoint.
+        # This keeps evaluation and continuation training reproducible without network.
+        self.encoder = resnet18(False, args)
+        # Task 1.2 D: dropout p 从 0.5 降到 0.3，只在 MC-dropout 不确定性估计时临时打开
+        self.dropout = nn.Dropout(p=0.3)
         self.num_features = 512# 特征数量，ResNet18的输出特征维度
         self.fc = nn.Linear(self.num_features, 100, bias=True)# 分类层，将特征映射到100个类  
         hdim=self.num_features# 隐藏状态维度  
@@ -30,8 +33,6 @@ class MYNET(nn.Module):
         self.transatt_proto = MultiHeadAttention(1, hdim, hdim, hdim, dropout=0.5)
         self.cls_classifier = Classifier(args, self.num_features,args.train_weight_base) # 分类器 
         self.set_module_for_audio(args) # 音频模块的设置（可能涉及音频特征）
-        # self.cluster_loss_weight = 0.5  # 可配置参数
-        self.feature_enhance = LocalFeatureCluster(feat_dim=64, k_ratio=0.3)
     def forward(self,input,labels=None, conj_ids=None, base_ids=None, test=False):
         # 定义前向传播过程 
         if self.mode == 'encoder':# 如果模式是'encoder'，则只进行编码
@@ -45,7 +46,75 @@ class MYNET(nn.Module):
             support_idx, query_idx = input# 获取支持集和查询集索引 
             logits = self._forward(support_idx, query_idx)# 执行另一个前向传播 
             return logits
-
+    def get_uncertainty(self, x, n_aug=5, n_forward=5):
+        """
+        计算样本的不确定性
+        """
+        # 1. 临时保存并切换 mode
+        # 这一步至关重要！强制 hgnn_encode 只返回特征(512维)，不经过fc
+        _original_mode = self.mode
+        self.mode = 'feature_extraction' 
+        
+        # 2. 开启 MC Dropout
+        self.eval() 
+        for m in self.modules():
+            if isinstance(m, nn.Dropout):
+                m.train()
+        
+        device = next(self.parameters()).device
+        if x.dim() == 3: x = x.unsqueeze(0)
+        x = x.to(device)
+        
+        probs_list = []
+        
+        try:
+            with torch.no_grad():
+                for _ in range(n_aug):
+                    for _ in range(n_forward):
+                        # A. 特征提取 
+                        # 因为 mode 变了，这里现在返回 512 维特征
+                        feat = self.base_encode(x, augment=True)
+                        
+                        # C. 维度规约
+                        if feat.dim() > 2:
+                            feat = feat.mean(dim=[2, 3])
+                        
+                        # D. 手动计算概率
+                        # 使用 self.fc.weight 作为原型
+                        logits = self.get_logits(feat, self.fc.weight)
+                        prob = F.softmax(logits, dim=-1)
+                        probs_list.append(prob)
+                        
+        finally:
+            # 3. [必须] 恢复原始 mode
+            # 否则后续的训练步骤会因为 mode 错误而崩盘
+            self.mode = _original_mode
+        
+        # 4. Compute uncertainty from three complementary signals.  Raw nuclear
+        # norm is useful for confidence/dispersity, but its absolute value is not
+        # monotonic uncertainty: confident one-hot predictions can have a larger
+        # norm.  We therefore apply the nuclear norm to the *centered* MC prediction
+        # matrix, where it measures prediction disagreement (epistemic uncertainty).
+        P = torch.stack(probs_list, dim=0) # [N_views, B, N_class]
+        if x.size(0) > 1:
+            P = P.permute(1, 0, 2)
+            mean_p = P.mean(dim=1).clamp_min(1e-8)
+            pred_entropy = -(mean_p * mean_p.log()).sum(dim=-1)
+            sample_entropy = -(P.clamp_min(1e-8) * P.clamp_min(1e-8).log()).sum(dim=-1).mean(dim=1)
+            mutual_info = (pred_entropy - sample_entropy).clamp_min(0.0)
+            centered = P - P.mean(dim=1, keepdim=True)
+            nuclear_disagreement = torch.linalg.matrix_norm(centered, ord='nuc', dim=(1, 2))
+            nuclear_disagreement = nuclear_disagreement / (P.size(1) ** 0.5)
+            return (pred_entropy + mutual_info + 0.25 * nuclear_disagreement).detach()
+        else:
+            P = P.squeeze(1)
+            mean_p = P.mean(dim=0).clamp_min(1e-8)
+            pred_entropy = -(mean_p * mean_p.log()).sum()
+            sample_entropy = -(P.clamp_min(1e-8) * P.clamp_min(1e-8).log()).sum(dim=-1).mean()
+            mutual_info = torch.clamp(pred_entropy - sample_entropy, min=0.0)
+            centered = P - P.mean(dim=0, keepdim=True)
+            nuclear_disagreement = torch.linalg.matrix_norm(centered, ord='nuc') / (P.size(0) ** 0.5)
+            return float((pred_entropy + mutual_info + 0.25 * nuclear_disagreement).detach().cpu())
     def open_forward(self, the_input, labels, conj_ids, base_ids, test):
          # Data Preparation
         # print(type(the_input))
@@ -78,24 +147,145 @@ class MYNET(nn.Module):
             return test_feats, cls_protos, test_cls_probs# 返回特征、原型和类概率 
 
         
+        pair_dist = torch.norm(fakeclass_protos - supp_protos, p=2, dim=-1) # [Batch, N_way]
+        # Task 1.4: margin 可配置
+        margin = float(getattr(self.args, 'hinge_margin', 2.0))
+        # 3. 计算 Hinge Loss
+        # 只有当距离 < Margin 时，才产生 Loss，强迫生成器把负原型往外推
+        loss_open_hinge = torch.relu(margin - pair_dist).mean()
 
+        # Path C: dual prototype cosine orthogonality loss
+        # 诊断发现 pos-vs-neg cos=0.506, L2 hinge 并不约束方向。这里强制让 cos(pos,neg) <= dual_cos_margin.
+        dual_cos_w = float(getattr(self.args, 'dual_cos_weight', 0.0))
+        dual_cos_m = float(getattr(self.args, 'dual_cos_margin', 0.2))
+        if dual_cos_w > 0.0:
+            pos_n = F.normalize(supp_protos, dim=-1)
+            neg_n = F.normalize(fakeclass_protos, dim=-1)
+            cos_pn = (pos_n * neg_n).sum(dim=-1)              # [B, N]
+            loss_dual_cos = F.relu(cos_pn - dual_cos_m).pow(2).mean()
+            # neg diversity: 5 个负原型之间也别坍缩 (当前 neg_pair_cos=0.22, 目标 <0.1)
+            neg_div_m = float(getattr(self.args, 'neg_div_margin', 0.1))
+            B, N, _ = neg_n.shape
+            if N >= 2:
+                neg_sim = torch.bmm(neg_n, neg_n.transpose(1, 2))   # [B, N, N]
+                eye = torch.eye(N, device=neg_sim.device).unsqueeze(0)
+                neg_off = neg_sim * (1 - eye)
+                loss_neg_div = F.relu(neg_off - neg_div_m).pow(2).sum(dim=(1, 2)).mean() / max(1, N * (N - 1))
+            else:
+                loss_neg_div = torch.tensor(0.0, device=cos_pn.device)
+            loss_open_hinge = loss_open_hinge + dual_cos_w * (loss_dual_cos + 0.5 * loss_neg_div)
+
+        # Path D: inter-class prototype separation (防止已知类原型之间 cos 太高 → 未知样本"碰巧"靠近)
+        inter_cos_w = float(getattr(self.args, 'inter_cos_weight', 0.0))
+        inter_cos_m = float(getattr(self.args, 'inter_cos_margin', 0.3))
+        if inter_cos_w > 0.0:
+            sn = F.normalize(supp_protos, dim=-1)               # [B, N, D]
+            B, N, _ = sn.shape
+            if N >= 2:
+                pair_cos = torch.bmm(sn, sn.transpose(1, 2))    # [B, N, N]
+                eye = torch.eye(N, device=sn.device).unsqueeze(0)
+                off_diag = pair_cos * (1 - eye)
+                # 惩罚 cos > margin 的对
+                loss_inter_cos = F.relu(off_diag - inter_cos_m).pow(2).sum(dim=(1, 2)).mean() / max(1, N * (N - 1))
+            else:
+                loss_inter_cos = torch.tensor(0.0, device=sn.device)
+            loss_open_hinge = loss_open_hinge + inter_cos_w * loss_inter_cos
+
+        # Path E: explicit per-sample OSR margin loss
+        # 核心逻辑: 对每个样本，找最近正原型，比较其正负原型分数
+        #   known (query):   期望 pos - neg >  margin → 正分显著高于负分
+        #   unknown (openset): 期望 neg - pos >  margin → 负分高于正分（负原型=不属于此类）
+        osr_margin_w = float(getattr(self.args, 'osr_margin_weight', 0.0))
+        osr_margin_val = float(getattr(self.args, 'osr_margin_val', 0.5))
+        if osr_margin_w > 0.0:
+            nw = self.args.n_ways
+            (query_cls_scores, openset_cls_scores) = test_cosine_scores
+            # known (query): 正分应大于负分
+            q_pos = query_cls_scores[:, :, :nw]           # [B, Nq, N]
+            q_neg = query_cls_scores[:, :, nw:]            # [B, Nq, N]
+            q_pred = torch.argmax(q_pos, dim=-1)           # [B, Nq]
+            q_p = q_pos.gather(-1, q_pred.unsqueeze(-1)).squeeze(-1)
+            q_n = q_neg.gather(-1, q_pred.unsqueeze(-1)).squeeze(-1)
+            loss_osr_known = F.relu(osr_margin_val - (q_p - q_n)).mean()
+            # unknown (openset): 负分应大于正分（最近正类 对应的 负原型）
+            o_pos = openset_cls_scores[:, :, :nw]
+            o_neg = openset_cls_scores[:, :, nw:]
+            o_hard = torch.argmax(o_pos, dim=-1)           # 最近正类
+            o_p = o_pos.gather(-1, o_hard.unsqueeze(-1)).squeeze(-1)
+            o_n = o_neg.gather(-1, o_hard.unsqueeze(-1)).squeeze(-1)
+            loss_osr_unknown = F.relu(osr_margin_val - (o_n - o_p)).mean()
+            loss_osr_margin = loss_osr_known + loss_osr_unknown
+            loss_open_hinge = loss_open_hinge + osr_margin_w * loss_osr_margin
         #loss_open_hinge = 0.0
-        loss_open_hinge = F.mse_loss(fakeclass_protos.repeat(1,self.args.n_ways, 1), supp_protos)# 计算开放集的hinge损失（这里使用均方误差） 
-        #loss_open_hinge_2 = F.mse_loss(fakeclass_protos_aug.repeat(1,self.args.n_ways, 1), supp_protos_aug) 
-        #loss_open_hinge = loss_open_hinge_1 + loss_open_hinge_2
+        # dist = torch.norm(fakeclass_protos.repeat(1, self.args.n_ways, 1) - supp_protos, p=2, dim=-1)
+        
+        # # 设定一个 Margin (比如 2.0，特征归一化后最大距离是2)，强迫两者距离至少为 Margin
+        # # 如果距离小于 Margin，产生 Loss；距离拉大后 Loss 为 0
+        # loss_open_hinge = torch.relu(2.0 - dist).mean()
+        # loss_open_hinge = F.mse_loss(fakeclass_protos.repeat(1,self.args.n_ways, 1), supp_protos)# 计算开放集的hinge损失（这里使用均方误差） 
+
         
         
         loss = (loss_cls, loss_open_hinge, loss_funit)
         return test_feats, cls_protos, test_cls_probs, loss
     
-    
-    def task_proto(self, features, cls_ids, cls_label,query_label,test=False):
-        test_cosine_scores, supp_protos, fakeclass_protos, funit_distance = self.cls_classifier(features, cls_ids,test)
-        (query_cls_scores,openset_cls_scores) = test_cosine_scores
-        cls_scores = torch.cat([query_cls_scores,openset_cls_scores], dim=1)
-        fakeunit_loss = self.fakeunit_compare(funit_distance,query_label)
-        loss_cls = F.cross_entropy(cls_scores.squeeze(), cls_label)
+    def task_proto(self, features, cls_ids, cls_label, query_label, test=False):
+        # 1. 前向传播获取分数
+        # supp_protos: [B, N, D]
+        # fakeclass_protos: [B, N, D]
+        # test_cosine_scores: (query_scores, openset_scores)
+        # 其中 openset_scores 维度是 [B, N_open, 2*N_way]
+        test_cosine_scores, supp_protos, fakeclass_protos, funit_distance = self.cls_classifier(features, cls_ids, test)
+        
+        (query_cls_scores, openset_cls_scores) = test_cosine_scores
+        
+        # ==================【核心修改：动态标签分配】==================
+        # 我们只修改 openset_data (未知样本) 的标签
+        # query_label (已知样本) 保持不变
+        
+        # 1. 提取未知样本的正类分数 (前 n_ways 列)
+        n_ways = self.args.n_ways
+        # openset_cls_scores: [Batch, N_shot, 2*N_ways] -> 取前 N_ways
+        openset_pos_scores = openset_cls_scores[:, :, :n_ways] 
+        
+        # 2. 找到每个未知样本"最像"的那个已知类 (Hard Positive)
+        # 例如：样本最像第 2 类，则 hard_pos_idx = 2
+        hard_pos_idx = torch.argmax(openset_pos_scores, dim=-1) # [Batch, N_shot]
+        
+        # 3. 生成动态标签
+        # 它的目标应该是该类的负原型 (索引 = 2 + 5 = 7)
+        dynamic_openset_label = hard_pos_idx + n_ways
+        
+        # 4. 拼接最终的标签
+        # query_label: [Batch, N_query] (保持原样)
+        # dynamic_openset_label: [Batch, N_query] (扁平化以匹配)
+        
+        # 注意：这里需要确保维度匹配。通常 cls_label 是拼接好的，我们现在要重构它。
+        # 原来的 cls_label 在 open_forward 里是 cat([query_label, openset_label])
+        # 我们现在只用 query_label，加上新算的 label
+        
+        final_cls_label = torch.cat([query_label.view(-1), dynamic_openset_label.view(-1)])
+        final_cls_label = final_cls_label.long().to(query_label.device)
+        
+        # 5. 拼接分数
+        # [Batch, N_total, 2*N_ways]
+        cls_scores = torch.cat([query_cls_scores, openset_cls_scores], dim=1)
+        
+        # ============================================================
+
+        fakeunit_loss = self.fakeunit_compare(funit_distance, query_label)
+        
+        # 使用动态标签计算 Cross Entropy
+        loss_cls = F.cross_entropy(cls_scores.view(-1, 2*n_ways), final_cls_label)
+        
         return test_cosine_scores, supp_protos, fakeclass_protos, loss_cls, fakeunit_loss
+    # def task_proto(self, features, cls_ids, cls_label,query_label,test=False):
+    #     test_cosine_scores, supp_protos, fakeclass_protos, funit_distance = self.cls_classifier(features, cls_ids,test)
+    #     (query_cls_scores,openset_cls_scores) = test_cosine_scores
+    #     cls_scores = torch.cat([query_cls_scores,openset_cls_scores], dim=1)
+    #     fakeunit_loss = self.fakeunit_compare(funit_distance,query_label)
+    #     loss_cls = F.cross_entropy(cls_scores.squeeze(), cls_label)
+    #     return test_cosine_scores, supp_protos, fakeclass_protos, loss_cls, fakeunit_loss
     
     def fakeunit_compare(self,funit_distance,cls_label):
         cls_label_binary = F.one_hot(cls_label).float()
@@ -161,43 +351,63 @@ class MYNET(nn.Module):
         cat_emb = torch.cat([sup_emb, query], dim=1)
         att_pq, att_logit = self.transatt_proto(cat_emb, cat_emb, cat_emb)
         att_logit = att_logit[:, :, -1][:, :-1] # 选取最后一列的前shot*way个logits
-        att_score = torch.softmax(att_logit.view(num_query, args.episode.episode_shot, -1), dim=1)
+        att_score = torch.softmax(
+            att_logit.view(num_query, self.args.episode.episode_shot, -1), dim=1)
         att_proto, _ = att_pq.split(sup_emb.shape[1], dim=1)
-        att_proto = att_proto.view(num_query, args.episode.episode_shot, -1, emb_dim) * att_score.unsqueeze(-1) # args.episode_way+args.low_way
+        att_proto = att_proto.view(
+            num_query, self.args.episode.episode_shot, -1, emb_dim
+        ) * att_score.unsqueeze(-1)
         att_proto = att_proto.sum(1)
         return att_proto
 
-    def get_featmap(self,input):
-        x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-        x = x.repeat(1, 3, 1, 1)
-        feat_map = self.encoder(input)
-        return feat_map
-    def enhance_encode(self,x):
-        x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-        x = x.repeat(1, 3, 1, 1)
+    def forward_to_stage(self, x, stage='layer4', augment=False):
+        """Return an unpooled ResNet stage map for structure ablations.
 
+        Args:
+            x: waveform batch ``[B, samples]``.
+            augment: apply the existing spectrogram augmentation before the backbone.
+
+        Returns:
+            Stage feature map ``[B, C, H, W]``. ``H`` and ``W`` are latent
+            spatial axes; this method does not assign them a physical interpretation.
+        """
+        if stage not in {'layer2', 'layer3', 'layer4'}:
+            raise ValueError(f"Unsupported structure stage: {stage}")
+        x = self.spectrogram_extractor(x)   # [B, 1, frames, fft_bins]
+        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        if augment:
+            x = self.spec_augmenter(x)
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        x = x.repeat(1, 3, 1, 1)
         x = self.encoder.conv1(x)
         x = self.encoder.bn1(x)
         x = self.encoder.relu(x)
+        if hasattr(self.encoder, 'maxpool'):
+            x = self.encoder.maxpool(x)
         x = self.encoder.layer1(x)
-        x = self.feature_enhance(x) 
         x = self.encoder.layer2(x)
-        x = self.encoder.layer3(x)               # (B, C, H, W) <- 保留空间维度  
+        if stage == 'layer2':
+            return x
+        x = self.encoder.layer3(x)
+        if stage == 'layer3':
+            return x
+        return self.encoder.layer4(x)
 
-        x = self.encoder.layer4(x)
-        x = F.adaptive_avg_pool2d(x, 1)
-        x = x.squeeze(-1).squeeze(-1)
-        if self.mode=="encoder":
-            x = self.fc(x)
-        return x       
+    def forward_to_layer4(self, x, augment=False):
+        """Backward-compatible layer4 extraction path."""
+        feat_map = self.forward_to_stage(x, stage='layer4', augment=augment)
+        if feat_map.dim() != 4 or feat_map.size(1) != 512:
+            raise RuntimeError(
+                f"Expected layer4 map [B, 512, H, W], got {tuple(feat_map.shape)}"
+            )
+        return feat_map
+
+    def get_featmap(self, input):
+        """Backward-compatible alias for the verified layer4 extraction path."""
+        return self.forward_to_layer4(input, augment=False)
+
     def pre_encode(self, x):
         x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
@@ -366,19 +576,42 @@ class MYNET(nn.Module):
         x = x.transpose(1, 3)
         x = x.repeat(1, 3, 1, 1)#[128 3 201 128]
         x = self.encoder(x)
+        # x = self.dropout(x)
         x = F.adaptive_avg_pool2d(x, 1)
         x = x.squeeze(-1).squeeze(-1)
         if self.mode=="encoder":
             x = self.fc(x)
         return x
-    def hgnn_encode(self, x):
+    def base_encode(self, x, augment = False):
         x = self.spectrogram_extractor(x)  # (B, 1, T, F)
         x = self.logmel_extractor(x)      # (B, 1, T, M)
+        if augment:
+            x = self.spec_augmenter(x)
         x = x.transpose(1, 3)             # (B, M, T, 1)
         x = self.bn0(x)
         x = x.transpose(1, 3)             # (B, 1, T, M)
         x = x.repeat(1, 3, 1, 1)          # (B, 3, T, M)
         x = self.encoder(x)               # (B, C, H, W) <- 保留空间维度
+        if x.dim() > 2:
+            x = F.adaptive_avg_pool2d(x, 1) # [B, 512, 1, 1]
+            x = x.flatten(1)                # [B, 512]
+        if hasattr(self, 'dropout'):
+            x = self.dropout(x)
+        if self.mode == "encoder":
+            x = self.fc(x)  # 如果fc需要全局特征，可保留
+        return x
+    def hgnn_encode(self, x, augment = False):
+        x = self.spectrogram_extractor(x)  # (B, 1, T, F)
+        x = self.logmel_extractor(x)      # (B, 1, T, M)
+        if augment:
+            x = self.spec_augmenter(x)
+        x = x.transpose(1, 3)             # (B, M, T, 1)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)             # (B, 1, T, M)
+        x = x.repeat(1, 3, 1, 1)          # (B, 3, T, M)
+        x = self.encoder(x)               # (B, C, H, W) <- 保留空间维度
+        if hasattr(self, 'dropout'):
+            x = self.dropout(x)
         if self.mode == "encoder":
             x = self.fc(x)  # 如果fc需要全局特征，可保留
         return x
@@ -506,8 +739,13 @@ def replace_base_fc(args,trainset, model):
     num_base_class =  args.num_base
     model = model.eval()
     assert len(set(trainset.targets)) == num_base_class
-    trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=128,
-                                                num_workers=8, pin_memory=True, shuffle=False)
+    trainloader = torch.utils.data.DataLoader(
+        dataset=trainset,
+        batch_size=128,
+        num_workers=args.dataloader.num_workers,
+        pin_memory=True,
+        shuffle=False,
+    )
     # trainloader.dataset.transform = transform
     embedding_list = []
     label_list = []

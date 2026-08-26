@@ -25,6 +25,38 @@ def meta_train(args, model,train_loader, eval_loader=True):
     model.load_state_dict(model_dict)
     model.train()
     optim_param = [{'params': model.cls_classifier.parameters()}]
+    if getattr(args, 'finetune_encoder', False):
+        scale = float(getattr(args, 'encoder_lr_scale', 0.01))
+        enc_lr = args.learning_rate * scale
+        # 确定解封层：默认 layer4，若指定 finetune_layers 则按列表
+        ft_layers = getattr(args, 'finetune_layers', 'layer4')
+        if isinstance(ft_layers, str):
+            ft_layers = [s.strip() for s in ft_layers.split(',')]
+        # 关闭所有 encoder 梯度，再按需开启
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        ft_params = []
+        for layer_name in ft_layers:
+            layer = getattr(model.encoder, layer_name, None)
+            if layer is not None:
+                for p in layer.parameters():
+                    p.requires_grad = True
+                ft_params.extend(layer.parameters())
+        optim_param.append({'params': ft_params, 'lr': enc_lr})
+        print(f"==> [v2] finetune_encoder=True, layers={ft_layers}, lr={enc_lr:.6f} (base lr={args.learning_rate}, scale={scale})")
+        # Path Y: snapshot init params of the fine-tuned layers for anchor loss
+        base_anchor_w = float(getattr(args, 'base_anchor_weight', 0.0))
+        if base_anchor_w > 0.0:
+            anchor_init = [p.detach().clone() for p in ft_params]
+            print(f"==> [Y] base_anchor_weight={base_anchor_w:.4f}, anchoring {len(ft_params)} tensors in layers={ft_layers}")
+        else:
+            anchor_init = None
+    else:
+        # 保持默认：encoder 全部冻结梯度
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        ft_params = []
+        anchor_init = None
     optimizer = optim.SGD(optim_param, lr=args.learning_rate, momentum=args.optimizer.momentum, weight_decay=args.optimizer.decay, nesterov=True)
     if args.cosine:
         print("==> training with plateau scheduler ...")
@@ -47,7 +79,7 @@ def meta_train(args, model,train_loader, eval_loader=True):
         else:
             adjust_learning_rate(epoch, args, optimizer, 0.0001)
             
-        train_acc, train_auroc, train_loss, train_msg = train_episode(epoch, train_loader, model, optimizer, args)
+        train_acc, train_auroc, train_loss, train_msg = train_episode(epoch, train_loader, model, optimizer, args, ft_params=ft_params, anchor_init=anchor_init)
 
         model.eval()
 
@@ -78,16 +110,28 @@ def meta_train(args, model,train_loader, eval_loader=True):
         # # print(meta_test_acc[0])
         # print(trlog['maxmeta_acc'],trlog['maxmeta_acc_epoch'])
 
-        # regular saving
+        # Save every epoch so a long Meta run can be resumed after an I/O or
+        # host failure.  The previous 5-epoch cadence could lose hours of
+        # training before the first usable Meta checkpoint was flushed.
+        save_model(model, epoch, args, name='epoch_{:03d}'.format(epoch),
+                   acc_auroc=(train_acc, train_auroc))
         if epoch % 5 == 0:
-            save_model(model,epoch,args)
             print('The Best Meta Acc {:.4f} in Epoch {}, Best Meta AUROC {:.4f} in Epoch {}'.format(trlog['maxmeta_acc'],trlog['maxmeta_acc_epoch'],trlog['maxmeta_auroc'],trlog['maxmeta_auroc_epoch']))
 
 
-def train_episode(epoch, train_loader, model, optimizer, args):
+def train_episode(epoch, train_loader, model, optimizer, args, ft_params=None, anchor_init=None):
     """One epoch training"""
     model.train()
     model.encoder.eval()
+    if getattr(args, 'finetune_encoder', False):
+        # 解封指定层的 BN running stats 更新
+        ft_layers = getattr(args, 'finetune_layers', 'layer4')
+        if isinstance(ft_layers, str):
+            ft_layers = [s.strip() for s in ft_layers.split(',')]
+        for layer_name in ft_layers:
+            layer = getattr(model.encoder, layer_name, None)
+            if layer is not None:
+                layer.train()
 
 
     batch_time = AverageMeter()
@@ -140,19 +184,62 @@ def train_episode(epoch, train_loader, model, optimizer, args):
             loss_open = args.gamma * loss_open_hinge + args.funit * loss_funit
 
             loss = loss_open + loss_cls
-                
-            ### Closed Set Accuracy
-            close_pred = np.argmax(probs[0][:,:,:args.n_ways].view(-1,args.n_ways).cpu().numpy(),-1)
-            close_label = query_label.view(-1).cpu().numpy()
-            acc.update(metrics.accuracy_score(close_label, close_pred),1)
+            # Path Y: base anchor loss -- pull fine-tuned encoder layers back toward init to prevent drift
+            anchor_w = float(getattr(args, 'base_anchor_weight', 0.0))
+            if anchor_w > 0.0 and ft_params is not None and anchor_init is not None:
+                loss_anchor = 0.0
+                for p_cur, p_init in zip(ft_params, anchor_init):
+                    loss_anchor = loss_anchor + (p_cur - p_init).pow(2).sum()
+                loss = loss + anchor_w * loss_anchor
+            n = args.n_ways
+            
+            # 针对 Query Data (已知类)
+            q_pos = query_cls_probs[:, :, :n] # [B, N_q, 5]
+            q_neg = query_cls_probs[:, :, n:] # [B, N_q, 5]
+            
+            # 针对 Openset Data (未知类)
+            o_pos = openset_cls_probs[:, :, :n] # [B, N_o, 5]
+            o_neg = openset_cls_probs[:, :, n:] # [B, N_o, 5]
+            
+            # 2. 计算 Closed Set Accuracy (只看正类分数)
+            # 展平 Batch 和 Query 维度
+            # q_pos.reshape(-1, n) -> [75, 5]
+            pos_scores_flat = q_pos.reshape(-1, n).detach().cpu().numpy()
+            
+            close_pred = np.argmax(pos_scores_flat, axis=-1) # [75]
+            close_label = query_label.view(-1).cpu().numpy() # [75]
+            
+            acc.update(metrics.accuracy_score(close_label, close_pred), 1)
 
-            ### Open Set AUROC
-            open_label_binary = np.concatenate((np.ones(close_pred.shape),np.zeros(close_pred.shape)))
-            query_cls_probs = query_cls_probs.view(-1, args.n_ways+1)
-            openset_cls_probs = openset_cls_probs.view(-1, args.n_ways+1)
-            open_scores = torch.cat([query_cls_probs,openset_cls_probs], dim=0).cpu().numpy()[:,-1]
-            auroc.update(metrics.roc_auc_score(1-open_label_binary,open_scores),1)
+            # 3. 计算 Open Set AUROC (基于 1对1 判决)
+            # Unknown Score = Max(Neg - Pos)
+            # 逻辑：如果最可能的类别的 负分 > 正分，则是未知类
+            
+            def get_uncertainty_score(p_scores, n_scores):
+                # p_scores, n_scores: [B, N, 5]
+                # 找到每个样本预测类别的索引
+                preds = torch.argmax(p_scores, dim=-1) # [B, N]
                 
+                # 取出预测类别对应的正分和负分
+                # gather: [B, N, 1]
+                p_val = torch.gather(p_scores, -1, preds.unsqueeze(-1)).squeeze(-1)
+                n_val = torch.gather(n_scores, -1, preds.unsqueeze(-1)).squeeze(-1)
+                
+                # 分数越高越可能是未知类
+                # 原始逻辑：Positive > Negative -> Known
+                # 逆转逻辑：Negative - Positive > 0 -> Unknown
+                return (n_val - p_val).view(-1).detach().cpu().numpy()
+
+            score_known = get_uncertainty_score(q_pos, q_neg) # 期望很小 (负 < 正)
+            score_unknown = get_uncertainty_score(o_pos, o_neg) # 期望很大 (负 > 正)
+            
+            # 拼接
+            scores_all = np.concatenate([score_known, score_unknown])
+            # 标签：已知类=0，未知类=1
+            labels_all = np.concatenate([np.zeros(len(score_known)), np.ones(len(score_unknown))])
+            
+            if len(np.unique(labels_all)) > 1:
+                auroc.update(metrics.roc_auc_score(labels_all, scores_all), 1)
                 
             losses_cls.update(loss_cls.item(), 1)
             losses_funit.update(loss_funit.item(), 1)

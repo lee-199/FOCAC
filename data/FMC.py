@@ -18,6 +18,25 @@ import pandas as pd
 from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
+
+def _metadata_tables(root, args=None):
+    """Resolve FSC-89 split tables without relying on a machine-specific path."""
+    explicit = str(getattr(args, 'fsc89_metadata_root', '') or '') if args is not None else ''
+    metadata_root = explicit or os.path.join(os.path.dirname(os.path.abspath(root)), 'FSC-89-meta', 'mini')
+    names = {
+        'train': 'Fsc89-mini-fsci_train.csv',
+        'val': 'Fsc89-mini-fsci_val.csv',
+        'test': 'Fsc89-mini-fsci_test.csv',
+    }
+    paths = {split: os.path.join(metadata_root, name) for split, name in names.items()}
+    missing = [path for path in paths.values() if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            'FSC-89 metadata tables were not found. Set --fsc89_metadata_root to '
+            f'the directory containing {", ".join(names.values())}; missing={missing}'
+        )
+    return paths
+
 class FSDCLIPS(Dataset):
 
     def __init__(self, root='./', phase='train', 
@@ -29,12 +48,24 @@ class FSDCLIPS(Dataset):
         self.phase = phase
         self.list = 0
         # self.train = train  # training set or test set
-        self.all_train_df = pd.read_csv("/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD_MIX_CLIPS.annotations_revised/FSC-89-meta/mini/Fsc89-mini-fsci_train.csv")
-        self.all_val_df = pd.read_csv("/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD_MIX_CLIPS.annotations_revised/FSC-89-meta/mini/Fsc89-mini-fsci_val.csv")
-        self.all_test_df = pd.read_csv("/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD_MIX_CLIPS.annotations_revised/FSC-89-meta/mini/Fsc89-mini-fsci_test.csv")
+        tables = _metadata_tables(root, args)
+        self.all_train_df = pd.read_csv(tables['train'])
+        self.all_val_df = pd.read_csv(tables['val'])
+        self.all_test_df = pd.read_csv(tables['test'])
         if phase == 'train':
             if base_sess:
-                self.data, self.targets = self.SelectfromClasses(self.all_train_df, index, per_num=None)
+                # The local 69-base protocol has official validation clips only
+                # for labels 0..58.  For labels 59..68, reserve the final 20%
+                # of each training class for validation and keep test sealed.
+                self.data, self.targets = [], []
+                for cls_id in index:
+                    cls_data, cls_targets = self.SelectfromClasses(
+                        self.all_train_df, [cls_id], per_num=None)
+                    if int(cls_id) >= 59:
+                        split = int(len(cls_data) * 0.8)
+                        cls_data, cls_targets = cls_data[:split], cls_targets[:split]
+                    self.data.extend(cls_data)
+                    self.targets.extend(cls_targets)
             else:
                 self.data1, self.targets1 = self.SelectfromClasses(self.all_test_df, index, per_num=None)
                 #if session==1:
@@ -46,9 +77,20 @@ class FSDCLIPS(Dataset):
                 self.targets =self.targets1+self.targets2
         elif phase == 'val':
             if base_sess:
-                self.data, self.targets = self.SelectfromClasses(self.all_test_df, index, per_num=None)
+                self.data, self.targets = [], []
+                for cls_id in index:
+                    if int(cls_id) < 59:
+                        cls_data, cls_targets = self.SelectfromClasses(
+                            self.all_val_df, [cls_id], per_num=None)
+                    else:
+                        cls_data, cls_targets = self.SelectfromClasses(
+                            self.all_train_df, [cls_id], per_num=None)
+                        split = int(len(cls_data) * 0.8)
+                        cls_data, cls_targets = cls_data[split:], cls_targets[split:]
+                    self.data.extend(cls_data)
+                    self.targets.extend(cls_targets)
             else:
-                self.data, self.targets = self.SelectfromClasses(self.all_test_df, index, per_num=None)
+                self.data, self.targets = self.SelectfromClasses(self.all_val_df, index, per_num=None)
         elif phase =='test':
             self.data, self.targets = self.SelectfromClasses(self.all_test_df, index, per_num=None)
         
@@ -162,9 +204,10 @@ class Openfs(Dataset):
         self.root=root
         self.partition = partition
         self.args = args
-        self.all_train_df = pd.read_csv("/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD_MIX_CLIPS.annotations_revised/FSC-89-meta/mini/Fsc89-mini-fsci_train.csv")
-        self.all_val_df = pd.read_csv("/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD_MIX_CLIPS.annotations_revised/FSC-89-meta/mini/Fsc89-mini-fsci_val.csv")
-        self.all_test_df = pd.read_csv("/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD_MIX_CLIPS.annotations_revised/FSC-89-meta/mini/Fsc89-mini-fsci_test.csv")
+        tables = _metadata_tables(root, args)
+        self.all_train_df = pd.read_csv(tables['train'])
+        self.all_val_df = pd.read_csv(tables['val'])
+        self.all_test_df = pd.read_csv(tables['test'])
 
         if self.partition=='train' or self.partition=='val':
             self.datapath, self.labels = self.SelectfromClasses(self.all_train_df, index, per_num=None)
@@ -349,18 +392,3 @@ class Openfs(Dataset):
             return x,y    
     def __len__(self):
         return self.n_episodes
-
-if __name__ == '__main__':
-
-    # class_index = open(txt_path).read().splitlines()
-    base_class = 80
-    class_index = np.arange(base_class, 100)
-    dataroot = "/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD-MIX-CLIPS_data"
-    batch_size_base = 400
-    trainset = FSDCLIPS(root=dataroot, phase="train",  index=class_index, k=5,
-                      base_sess=True)
-    cls = np.unique(trainset.targets)
-    trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=batch_size_base, shuffle=True, num_workers=0,
-                                              pin_memory=True)
-    list(trainloader)  
-

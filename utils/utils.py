@@ -19,6 +19,45 @@ import torch.nn.functional as F
 import math
 _utils_pp = pprint.PrettyPrinter()
 
+
+def calculate_uncertainty_unlabeled(model, enhancer, sample, n_aug=5, n_forward=5):
+    """
+    计算无标签样本的不确定度 (基于特征掩码 + MC Dropout)
+    """
+    # 1. 开启 MC Dropout 模式 (Dropout 生效)
+    set_mcd_mode(model)
+    
+    features_list = []
+    device = next(model.parameters()).device
+    
+    if sample.dim() == 1:
+        sample = sample.unsqueeze(0)
+    sample = sample.to(device)
+
+    with torch.no_grad():
+        # 外层循环：不同的 Mask (通过 augment=True 触发)
+        for _ in range(n_aug):
+            # 内层循环：不同的 Dropout (通过 MC Dropout 触发)
+            for _ in range(n_forward):
+                
+                # 【关键】调用时开启 augment=True
+                # 这会触发 Log Mel 谱图上的随机时间/频率遮挡
+                feat = model.hgnn_encode(sample, augment=True) 
+                
+                # 通过增强模块
+                feat, _ = enhancer(feat) 
+                
+                if feat.dim() > 2:
+                    feat = feat.mean(dim=[2,3]) if feat.dim()==4 else feat.mean(dim=1)
+                
+                features_list.append(feat.squeeze())
+    
+    P = torch.stack(features_list)
+    
+    # 计算核范数
+    uncertainty = torch.norm(P, p='nuc').item()
+    
+    return uncertainty
 class LocalFeatureCluster(nn.Module):
     def __init__(self, feat_dim=512, k_ratio=0.3, temperature=0.1):
         super().__init__()
